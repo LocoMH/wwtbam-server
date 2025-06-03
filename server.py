@@ -1,7 +1,9 @@
 import asyncio
-from typing import Any
 import websockets
 import json
+
+# Use the updated ServerConnection type
+from websockets.server import ServerConnection
 
 # Simple token-based authentication
 VALID_TOKENS: dict[str, str] = {
@@ -13,7 +15,7 @@ VALID_TOKENS: dict[str, str] = {
 }
 
 # Store connections
-clients_by_role: dict[str, set[websockets.ServerConnection]] = {
+clients_by_role: dict[str, set[ServerConnection]] = {
     "controller": set(),
     "contestant": set(),
     "host": set(),
@@ -21,43 +23,57 @@ clients_by_role: dict[str, set[websockets.ServerConnection]] = {
     "audience": set(),
 }
 
+# Track role by websocket for dynamic reassignment
+websocket_roles: dict[ServerConnection, str] = {}
 
-async def register(websocket: websockets.ServerConnection) -> None:
+
+async def register(websocket: ServerConnection) -> None:
     try:
-        # Initial handshake
         data: str = await websocket.recv()
-        msg: dict[str, Any] = json.loads(data)
-
-        role: str = msg.get("role")
-        token: str = msg.get("token")
-
-        if role not in VALID_TOKENS:
-            await websocket.send(json.dumps({"error": "Unknown role"}))
-            return
-
-        if token != VALID_TOKENS[role]:
-            await websocket.send(json.dumps({"error": "Invalid token"}))
-            return
-
-        clients_by_role[role].add(websocket)
-        print(f"{role.capitalize()} connected")
-
+        msg: dict[str, object] = json.loads(data)
+        await handle_registration(websocket, msg)
         await listen(websocket)
-
     except websockets.ConnectionClosed:
         print("Connection closed")
     finally:
-        for role_set in clients_by_role.values():
-            role_set.discard(websocket)
+        unregister(websocket)
 
 
-async def listen(websocket: websockets.ServerConnection) -> None:
+async def handle_registration(
+    websocket: ServerConnection, msg: dict[str, object]
+) -> None:
+    role: str = msg.get("role")
+    token: str = msg.get("token")
+
+    if role not in VALID_TOKENS:
+        await websocket.send(json.dumps({"error": "Unknown role"}))
+        return
+
+    if token != VALID_TOKENS[role]:
+        await websocket.send(json.dumps({"error": "Invalid token"}))
+        return
+
+    unregister(websocket)
+
+    clients_by_role[role].add(websocket)
+    print(f"{role.capitalize()} connected")
+
+    websocket_roles[websocket] = role
+
+
+async def listen(websocket: ServerConnection) -> None:
     async for message in websocket:
+        print(f"Received message: {message}")
         try:
-            msg: dict[str, Any] = json.loads(message)
-            if websocket in clients_by_role["controller"]:
-                roles: list[str] | None = msg.get("roles")
-                payload: Any = msg.get("message")
+            msg: dict[str, object] = json.loads(message)
+            if "role" in msg and "token" in msg:
+                await handle_registration(websocket, msg)
+                continue
+
+            sender_role = websocket_roles.get(websocket)
+            if sender_role == "controller":
+                roles: list[str] = msg.get("roles")
+                payload: object = msg.get("message")
                 await send_to_roles(payload, roles)
             else:
                 await websocket.send(
@@ -67,20 +83,19 @@ async def listen(websocket: websockets.ServerConnection) -> None:
             await websocket.send(json.dumps({"error": "Invalid JSON"}))
 
 
-async def send_to_roles(message: Any, roles: list[str] | None) -> None:
-    async def send(ws: websockets.ServerConnection, message: Any):
-        await ws.send(json.dumps({"type": "message", "message": message}))
-
-    if roles is None:
-        for role, clients in clients_by_role.items():
-            for ws in clients:
-                await send(ws=ws, message=message)
-        return
-
+async def send_to_roles(message: object, roles: list[str] | None) -> None:
+    if not roles:
+        roles = list(clients_by_role.keys())
     for role in roles:
-        role_set: set[websockets.ServerConnection] = clients_by_role.get(role, set())
+        role_set: set[ServerConnection] = clients_by_role.get(role, set())
         for ws in role_set:
-            send(ws=ws, message=message)
+            await ws.send(json.dumps({"type": "message", "message": message}))
+
+
+def unregister(websocket: ServerConnection) -> None:
+    for role_set in clients_by_role.values():
+        role_set.discard(websocket)
+    websocket_roles.pop(websocket, None)
 
 
 async def main() -> None:
